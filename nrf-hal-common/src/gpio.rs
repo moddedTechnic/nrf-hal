@@ -1,3 +1,5 @@
+use core::future::Future;
+use core::task::{Context, Poll};
 use core::{convert::Infallible, marker::PhantomData};
 
 /// Disconnected pin in input mode (type state, reset value).
@@ -86,6 +88,7 @@ use crate::pac::P1;
 use crate::pac::P1_NS as P1;
 
 use embedded_hal::digital::{ErrorType, InputPin, OutputPin, StatefulOutputPin};
+use embedded_hal_async::digital::Wait;
 
 impl<MODE> Pin<MODE> {
     fn new(port: Port, pin: u8) -> Self {
@@ -370,6 +373,64 @@ impl InputPin for Pin<Output<OpenDrainIO>> {
 
     fn is_low(&mut self) -> Result<bool, Self::Error> {
         Ok(self.block().in_.read().bits() & (1 << self.pin()) == 0)
+    }
+}
+
+struct WaitFuture<'a, MODE> {
+    pin: &'a mut Pin<Input<MODE>>,
+    state: bool,
+}
+
+impl<'a, MODE> Future for WaitFuture<'a, MODE> {
+    type Output = Result<(), Infallible>;
+
+    fn poll(mut self: core::pin::Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        if self.pin.is_high().unwrap() == self.state {
+            Poll::Ready(Ok(()))
+        } else {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+impl<MODE> Wait for Pin<Input<MODE>> {
+    async fn wait_for_high(&mut self) -> Result<(), Self::Error> {
+        let pin = self;
+        let future = WaitFuture {
+            pin,
+            state: true,
+        };
+
+        future.await
+    }
+
+    async fn wait_for_low(&mut self) -> Result<(), Self::Error> {
+        let pin = self;
+        let future = WaitFuture {
+            pin,
+            state: false,
+        };
+
+        future.await
+    }
+
+    async fn wait_for_rising_edge(&mut self) -> Result<(), Self::Error> {
+        self.wait_for_low().await?;
+        self.wait_for_high().await
+    }
+
+    async fn wait_for_falling_edge(&mut self) -> Result<(), Self::Error> {
+        self.wait_for_high().await?;
+        self.wait_for_low().await
+    }
+
+    async fn wait_for_any_edge(&mut self) -> Result<(), Self::Error> {
+        if self.is_high()? {
+            self.wait_for_low().await
+        } else {
+            self.wait_for_high().await
+        }
     }
 }
 
