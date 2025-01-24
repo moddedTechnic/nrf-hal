@@ -22,6 +22,7 @@ use crate::pac::{
 #[cfg(feature = "embedded-hal-02")]
 use cast::u32;
 use embedded_hal::delay::DelayNs;
+use embedded_hal_async::delay::DelayNs as ADelayNS;
 
 #[cfg(any(feature = "52832", feature = "52833", feature = "52840"))]
 use crate::pac::{TIMER3, TIMER4};
@@ -40,6 +41,7 @@ use crate::pac::timer0::{
 };
 
 use core::{hint::spin_loop, marker::PhantomData};
+use core::future::Future;
 
 pub struct OneShot;
 pub struct Periodic;
@@ -374,6 +376,33 @@ where
 impl<T: Instance, U> DelayNs for Timer<T, U> {
     fn delay_ns(&mut self, ns: u32) {
         self.delay(ns / 1_000);
+    }
+}
+
+struct TimerFuture<'a, T: Instance> {
+    timer: &'a T,
+}
+
+impl<'a, T: Instance> Future for TimerFuture<'a, T> {
+    type Output = ();
+
+    fn poll(self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context) -> core::task::Poll<()> {
+        let this = self.get_mut();
+        if !this.timer.timer_running() {
+            this.timer.timer_reset_event();
+            core::task::Poll::Ready(())
+        } else {
+            cx.waker().wake_by_ref();
+            core::task::Poll::Pending
+        }
+    }
+}
+
+impl<T: Instance, U> ADelayNS for Timer<T, U> {
+    async fn delay_ns(&mut self, ns: u32) {
+        let cycles = ns / 1_000;
+        self.start(cycles);
+        TimerFuture { timer: &self.0 }.await;
     }
 }
 
