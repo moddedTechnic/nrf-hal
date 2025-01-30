@@ -765,7 +765,7 @@ impl<'c> Radio<'c> {
                 State::Disabled
             }
 
-            s => unreachable!("State {} is not a valid final state", s),
+            s => unreachable!("State {:?} is not a valid final state", s),
         }
     }
 
