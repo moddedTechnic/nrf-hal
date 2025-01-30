@@ -403,11 +403,15 @@ impl<'c> Radio<'c> {
         dma_end_fence();
 
         let crc = self.radio.rxcrc.read().rxcrc().bits() as u16;
-        if self.radio.crcstatus.read().crcstatus().bit_is_set() {
+        let result = if self.radio.crcstatus.read().crcstatus().bit_is_set() {
             Ok(crc)
         } else {
             Err(crc)
-        }
+        };
+
+        self.wait_for_state_a_async(STATE_A::RX_IDLE).await;
+
+        result
     }
 
     /// Listens for a packet for no longer than the specified amount of microseconds
@@ -800,6 +804,13 @@ impl<'c> Radio<'c> {
     fn wait_for_state_a(&self, state: STATE_A) {
         while self.radio.state.read().state().variant().unwrap() != state {}
     }
+
+    async fn wait_for_state_a_async(&self, state: STATE_A) {
+        StateAWaiter {
+            radio: &self.radio,
+            state,
+        }.await
+    }
 }
 
 struct EventWaiter<'a> {
@@ -826,6 +837,25 @@ impl<'a> Future for EventWaiter<'a> {
                 Event::End => this.radio.events_end.reset(),
                 Event::PhyEnd => this.radio.events_phyend.reset(),
             }
+            core::task::Poll::Ready(())
+        } else {
+            cx.waker().wake_by_ref();
+            core::task::Poll::Pending
+        }
+    }
+}
+
+struct StateAWaiter<'a> {
+    radio: &'a RADIO,
+    state: STATE_A,
+}
+
+impl<'a> Future for StateAWaiter<'a> {
+    type Output = ();
+
+    fn poll(self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context) -> core::task::Poll<()> {
+        let this = self.deref();
+        if this.radio.state.read().state().variant().unwrap() == this.state {
             core::task::Poll::Ready(())
         } else {
             cx.waker().wake_by_ref();
