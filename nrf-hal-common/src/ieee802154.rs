@@ -20,7 +20,7 @@ use core::{
 pub struct Radio<'c> {
     radio: RADIO,
     // RADIO needs to be (re-)enabled to pick up new settings
-    needs_enable: bool,
+    needs_enable: AtomicBool,
     lock: RadioLockManager,
     // used to freeze `Clocks`
     _clocks: PhantomData<&'c ()>,
@@ -212,7 +212,7 @@ impl<'c> Radio<'c> {
     /// Initializes the radio for IEEE 802.15.4 operation
     pub fn init<L, LSTAT>(radio: RADIO, _clocks: &'c Clocks<ExternalOscillator, L, LSTAT>) -> Self {
         let mut radio = Self {
-            needs_enable: false,
+            needs_enable: false.into(),
             radio,
             lock: RadioLockManager::new(),
             _clocks: PhantomData,
@@ -284,7 +284,7 @@ impl<'c> Radio<'c> {
 
     /// Changes the radio channel
     pub fn set_channel(&mut self, channel: Channel) {
-        self.needs_enable = true;
+        self.needs_enable.store(true, Ordering::Relaxed);
         unsafe {
             self.radio
                 .frequency
@@ -294,7 +294,7 @@ impl<'c> Radio<'c> {
 
     /// Changes the Clear Channel Assessment method
     pub fn set_cca(&mut self, cca: Cca) {
-        self.needs_enable = true;
+        self.needs_enable.store(true, Ordering::Relaxed);
         match cca {
             Cca::CarrierSense => self.radio.ccactrl.write(|w| w.ccamode().carrier_mode()),
             Cca::EnergyDetection { ed_threshold } => {
@@ -315,7 +315,7 @@ impl<'c> Radio<'c> {
 
     /// Changes the TX power
     pub fn set_txpower(&mut self, power: TxPower) {
-        self.needs_enable = true;
+        self.needs_enable.store(true, Ordering::Relaxed);
         self.radio
             .txpower
             .write(|w| w.txpower().variant(power._into()));
@@ -496,7 +496,7 @@ impl<'c> Radio<'c> {
         self.radio.tasks_start.write(|w| w.tasks_start().set_bit());
     }
 
-    fn cancel_recv(&mut self) {
+    fn cancel_recv(&self) {
         self.radio.tasks_stop.write(|w| w.tasks_stop().set_bit());
         self.wait_for_state_a(STATE_A::RX_IDLE);
         // DMA transfer may have been in progress so synchronize with its memory operations
@@ -722,7 +722,7 @@ impl<'c> Radio<'c> {
 
         let (disable, enable) = match state {
             State::Disabled => (false, true),
-            State::RxIdle => (false, self.needs_enable),
+            State::RxIdle => (false, self.needs_enable.load(Ordering::Relaxed)),
             // NOTE to avoid errata 204 (see rev1 v1.4) we do TXIDLE -> DISABLED -> RXIDLE
             State::TxIdle => (true, true),
         };
@@ -735,18 +735,18 @@ impl<'c> Radio<'c> {
         }
 
         if enable {
-            self.needs_enable = false;
+            self.needs_enable.store(false, Ordering::Relaxed);
             self.radio.tasks_rxen.write(|w| w.tasks_rxen().set_bit());
             self.wait_for_state_a(STATE_A::RX_IDLE);
         }
     }
 
     /// Moves the radio to the TXIDLE state
-    fn put_in_tx_mode(&mut self) {
+    fn put_in_tx_mode(&self) {
         let state = self.state();
 
-        if state != State::TxIdle || self.needs_enable {
-            self.needs_enable = false;
+        if state != State::TxIdle || self.needs_enable.load(Ordering::Relaxed) {
+            self.needs_enable.store(false, Ordering::Relaxed);
             self.radio.tasks_txen.write(|w| w.tasks_txen().set_bit());
             self.wait_for_state_a(STATE_A::TX_IDLE);
         }
