@@ -1,11 +1,5 @@
 //! IEEE 802.15.4 radio
 
-use core::{
-    marker::PhantomData,
-    ops::{self, RangeFrom},
-    sync::atomic::{self, Ordering},
-};
-
 use crate::{
     clocks::{Clocks, ExternalOscillator},
     pac::{
@@ -14,14 +8,77 @@ use crate::{
     },
     timer::{self, Timer},
 };
+use core::{
+    future::Future,
+    marker::PhantomData,
+    ops::{self, RangeFrom},
+    sync::atomic::{self, AtomicBool, Ordering},
+};
 
 /// IEEE 802.15.4 radio
 pub struct Radio<'c> {
     radio: RADIO,
     // RADIO needs to be (re-)enabled to pick up new settings
     needs_enable: bool,
+    lock: RadioLockManager,
     // used to freeze `Clocks`
     _clocks: PhantomData<&'c ()>,
+}
+
+struct RadioLockManager {
+    is_locked: AtomicBool,
+}
+
+struct RadioLock<'a> {
+    manager: &'a RadioLockManager,
+}
+
+struct WaitForLock<'a> {
+    manager: &'a RadioLockManager,
+}
+
+impl RadioLockManager {
+    const fn new() -> Self {
+        Self {
+            is_locked: AtomicBool::new(false),
+        }
+    }
+
+    async fn acquire(&self) -> RadioLock {
+        WaitForLock { manager: self }.await
+    }
+
+    fn acquire_blocking(&self) -> RadioLock {
+        while self.is_locked.load(Ordering::Acquire) {
+            // spin
+        }
+        self.is_locked.store(true, Ordering::Release);
+        RadioLock { manager: self }
+    }
+
+    fn release(&self, lock: RadioLock) {
+        drop(lock);
+    }
+}
+
+impl Drop for RadioLock<'_> {
+    fn drop(&mut self) {
+        self.manager.is_locked.store(false, Ordering::Release);
+    }
+}
+
+impl<'a> Future for WaitForLock<'a> {
+    type Output = RadioLock<'a>;
+
+    fn poll(self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context) -> core::task::Poll<Self::Output> {
+        if self.manager.is_locked.load(Ordering::Acquire) {
+            cx.waker().wake_by_ref();
+            core::task::Poll::Pending
+        } else {
+            self.manager.is_locked.store(true, Ordering::Release);
+            core::task::Poll::Ready(RadioLock { manager: self.manager })
+        }
+    }
 }
 
 /// Default Clear Channel Assessment method = Carrier sense
@@ -301,10 +358,12 @@ impl<'c> Radio<'c> {
 
     /// Receives one radio packet and copies its contents into the given `packet` buffer
     ///
-    /// This methods returns the `Ok` variant if the CRC included the packet was successfully
+    /// This method returns the `Ok` variant if the CRC included the packet was successfully
     /// validated by the hardware; otherwise it returns the `Err` variant. In either case, `packet`
     /// will be updated with the received packet's data
     pub fn recv(&mut self, packet: &mut Packet) -> Result<u16, u16> {
+        let _lock = self.lock.acquire_blocking();
+
         // Start the read
         // NOTE(unsafe) We block until reception completes or errors
         unsafe {
@@ -313,6 +372,27 @@ impl<'c> Radio<'c> {
 
         // wait until we have received something
         self.wait_for_event(Event::End);
+        dma_end_fence();
+
+        let crc = self.radio.rxcrc.read().rxcrc().bits() as u16;
+        if self.radio.crcstatus.read().crcstatus().bit_is_set() {
+            Ok(crc)
+        } else {
+            Err(crc)
+        }
+    }
+
+    pub async fn recv_async(&mut self, packet: &mut Packet) -> Result<u16, u16> {
+        let _lock = self.lock.acquire().await;
+
+        // Start the read
+        // NOTE(unsafe) We block until reception completes or errors
+        unsafe {
+            self.start_recv(packet);
+        }
+
+        // wait until we have received something
+        self.wait_for_event_async(Event::End).await;
         dma_end_fence();
 
         let crc = self.radio.rxcrc.read().rxcrc().bits() as u16;
@@ -335,6 +415,8 @@ impl<'c> Radio<'c> {
     /// Note that the time it takes to switch the radio to RX mode is included in the timeout count.
     /// This transition may take up to a hundred of microseconds; see the section 6.20.15.8 in the
     /// Product Specification for more details about timing
+    ///
+    /// The time to acquire the radio lock is also included in the timeout count.
     pub fn recv_timeout<I>(
         &mut self,
         packet: &mut Packet,
@@ -346,6 +428,8 @@ impl<'c> Radio<'c> {
     {
         // Start the timeout timer
         timer.start(microseconds);
+
+        let _lock = self.lock.acquire_blocking();
 
         // Start the read
         // NOTE(unsafe) We block until reception completes or errors
@@ -423,6 +507,8 @@ impl<'c> Radio<'c> {
     // NOTE we do NOT check the address of `packet` because the mutable reference ensures it's
     // allocated in RAM
     pub fn try_send(&mut self, packet: &mut Packet) -> Result<(), ()> {
+        let _lock = self.lock.acquire_blocking();
+
         // enable radio to perform cca
         self.put_in_rx_mode();
 
@@ -490,6 +576,8 @@ impl<'c> Radio<'c> {
     // NOTE we do NOT check the address of `packet` because the mutable reference ensures it's
     // allocated in RAM
     pub fn send(&mut self, packet: &mut Packet) {
+        let _lock = self.lock.acquire_blocking();
+
         // enable radio to perform cca
         self.put_in_rx_mode();
 
@@ -557,6 +645,8 @@ impl<'c> Radio<'c> {
     // NOTE we do NOT check the address of `packet` because the mutable reference ensures it's
     // allocated in RAM
     pub fn send_no_cca(&mut self, packet: &mut Packet) {
+        let _lock = self.lock.acquire_blocking();
+
         self.put_in_tx_mode();
 
         // clear related events
@@ -691,9 +781,49 @@ impl<'c> Radio<'c> {
         }
     }
 
+    async fn wait_for_event_async(&self, event: Event) {
+        EventWaiter {
+            radio: &self.radio,
+            event,
+        }
+        .await
+    }
+
     /// Waits until the radio state matches the given `state`
     fn wait_for_state_a(&self, state: STATE_A) {
         while self.radio.state.read().state().variant().unwrap() != state {}
+    }
+}
+
+struct EventWaiter<'a> {
+    radio: &'a RADIO,
+    event: Event,
+}
+
+impl<'a> Future for EventWaiter<'a> {
+    type Output = ();
+
+    fn poll(self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context) -> core::task::Poll<()> {
+        let this = self.get();
+        let ready = match this.event {
+            Event::End => this.radio.events_end.read().events_end().bit_is_clear(),
+            Event::PhyEnd => this
+                .radio
+                .events_phyend
+                .read()
+                .events_phyend()
+                .bit_is_clear(),
+        };
+        if ready {
+            match this.event {
+                Event::End => this.radio.events_end.reset(),
+                Event::PhyEnd => this.radio.events_phyend.reset(),
+            }
+            core::task::Poll::Ready(())
+        } else {
+            cx.waker().wake_by_ref();
+            core::task::Poll::Pending
+        }
     }
 }
 
