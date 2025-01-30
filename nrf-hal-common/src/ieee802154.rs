@@ -8,6 +8,7 @@ use crate::{
     },
     timer::{self, Timer},
 };
+use core::ops::Deref;
 use core::{
     future::Future,
     marker::PhantomData,
@@ -70,13 +71,18 @@ impl Drop for RadioLock<'_> {
 impl<'a> Future for WaitForLock<'a> {
     type Output = RadioLock<'a>;
 
-    fn poll(self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context) -> core::task::Poll<Self::Output> {
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context,
+    ) -> core::task::Poll<Self::Output> {
         if self.manager.is_locked.load(Ordering::Acquire) {
             cx.waker().wake_by_ref();
             core::task::Poll::Pending
         } else {
             self.manager.is_locked.store(true, Ordering::Release);
-            core::task::Poll::Ready(RadioLock { manager: self.manager })
+            core::task::Poll::Ready(RadioLock {
+                manager: self.manager,
+            })
         }
     }
 }
@@ -208,6 +214,7 @@ impl<'c> Radio<'c> {
         let mut radio = Self {
             needs_enable: false,
             radio,
+            lock: RadioLockManager::new(),
             _clocks: PhantomData,
         };
 
@@ -468,7 +475,7 @@ impl<'c> Radio<'c> {
         }
     }
 
-    unsafe fn start_recv(&mut self, packet: &mut Packet) {
+    unsafe fn start_recv(&self, packet: &mut Packet) {
         // NOTE we do NOT check the address of `packet` because the mutable reference ensures it's
         // allocated in RAM
 
@@ -710,7 +717,7 @@ impl<'c> Radio<'c> {
     }
 
     /// Moves the radio to the RXIDLE state
-    fn put_in_rx_mode(&mut self) {
+    fn put_in_rx_mode(&self) {
         let state = self.state();
 
         let (disable, enable) = match state {
@@ -804,7 +811,7 @@ impl<'a> Future for EventWaiter<'a> {
     type Output = ();
 
     fn poll(self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context) -> core::task::Poll<()> {
-        let this = self.get();
+        let this = self.deref();
         let ready = match this.event {
             Event::End => this.radio.events_end.read().events_end().bit_is_clear(),
             Event::PhyEnd => this
